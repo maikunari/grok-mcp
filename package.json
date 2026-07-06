@@ -1,13 +1,14 @@
 {
   "name": "grok-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server that delegates coding tasks to Grok Build (headless) as a subagent",
   "type": "module",
   "private": true,
   "license": "MIT",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:cli": "node scripts/cli-regression.mjs"
   },
   "engines": {
     "node": ">=18"

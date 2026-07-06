@@ -4,9 +4,18 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -16,7 +25,9 @@ const DEFAULT_MODEL = "grok-composer-2.5-fast";
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const ENV_TIMEOUT_MS =
   Number.parseInt(process.env.GROK_TASK_TIMEOUT_MS ?? "", 10) || DEFAULT_TIMEOUT_MS;
-const MAX_JOBS_KEPT = 50;
+const MAX_JOB_FILES = 100;
+const MAX_RESPONSE_CHARS = 16_000;
+const SCHEMA_VERSION = 2;
 
 // Claude Desktop spawns MCP servers with a minimal PATH that does not include
 // ~/.grok/bin, so prefer the known install location. GROK_BIN overrides.
@@ -25,12 +36,14 @@ const GROK_BIN =
   process.env.GROK_BIN ??
   (existsSync(join(GROK_HOME, "bin", "grok")) ? join(GROK_HOME, "bin", "grok") : "grok");
 
+// Job records persist here so results survive server restarts (which happen
+// on every Claude Desktop restart — exactly when in-memory state would vanish).
+const JOBS_DIR = join(homedir(), ".grok-mcp", "jobs");
+
 // Headless-only flag values, from `grok --help` (0.2.87). Verified behavior:
 // modes that leave any tool un-approved don't stall headless runs — grok
-// CANCELS them (stopReason "Cancelled", exit 0, no changes persisted).
-// "acceptEdits" cancels as soon as the task runs a shell command; "auto"
-// completes edits + commands. So auto/bypassPermissions are headless-viable
-// for coding tasks; acceptEdits only for pure-edit tasks.
+// CANCELS them (stopReason "Cancelled", exit 0). "acceptEdits" cancels as
+// soon as the task runs a shell command; "auto" completes edits + commands.
 const PERMISSION_MODES = [
   "default",
   "acceptEdits",
@@ -119,20 +132,18 @@ function gitDelta(cwd: string, before: GitSnapshot, after: GitSnapshot): GitDelt
 }
 
 // ---------------------------------------------------------------------------
-// session transcript (best effort; commands only — files come from git)
+// session transcript + signals (best effort; files come from git)
 // ---------------------------------------------------------------------------
+
+function sessionDir(cwd: string, sessionId: string): string {
+  return join(GROK_HOME, "sessions", encodeURIComponent(cwd), sessionId);
+}
 
 function readSessionCommands(cwd: string, sessionId: string): string[] {
   try {
-    const transcript = join(
-      GROK_HOME,
-      "sessions",
-      encodeURIComponent(cwd),
-      sessionId,
-      "chat_history.jsonl"
-    );
     const messages: any[] = [];
-    for (const line of readFileSync(transcript, "utf8").split("\n")) {
+    const raw = readFileSync(join(sessionDir(cwd, sessionId), "chat_history.jsonl"), "utf8");
+    for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       try {
         messages.push(JSON.parse(line));
@@ -170,15 +181,9 @@ function readSessionCommands(cwd: string, sessionId: string): string[] {
 // Transcript fallback for file lists in non-git directories.
 function readSessionFiles(cwd: string, sessionId: string): string[] {
   try {
-    const transcript = join(
-      GROK_HOME,
-      "sessions",
-      encodeURIComponent(cwd),
-      sessionId,
-      "chat_history.jsonl"
-    );
     const files = new Set<string>();
-    for (const line of readFileSync(transcript, "utf8").split("\n")) {
+    const raw = readFileSync(join(sessionDir(cwd, sessionId), "chat_history.jsonl"), "utf8");
+    for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let m: any;
       try {
@@ -203,6 +208,21 @@ function readSessionFiles(cwd: string, sessionId: string): string[] {
     return [...files];
   } catch {
     return [];
+  }
+}
+
+function readSessionSignals(
+  cwd: string,
+  sessionId: string
+): { contextTokensUsed: number | null; toolCallCount: number | null } {
+  try {
+    const s = JSON.parse(readFileSync(join(sessionDir(cwd, sessionId), "signals.json"), "utf8"));
+    return {
+      contextTokensUsed: typeof s.contextTokensUsed === "number" ? s.contextTokensUsed : null,
+      toolCallCount: typeof s.toolCallCount === "number" ? s.toolCallCount : null,
+    };
+  } catch {
+    return { contextTokensUsed: null, toolCallCount: null };
   }
 }
 
@@ -266,27 +286,27 @@ interface ToolResult {
   isError?: boolean;
 }
 
+type JobStatus = "queued" | "running" | "completed" | "failed";
+
 interface Job {
   id: string;
   sessionId: string;
   cwd: string;
   model: string;
-  status: "running" | "completed" | "failed";
-  startedAt: number;
+  status: JobStatus;
+  queuedAt: number;
+  startedAt?: number;
   finishedAt?: number;
   result?: ToolResult;
   done: Promise<void>;
+  child?: ChildProcess;
+  cancelRequested?: boolean;
 }
 
 const jobs = new Map<string, Job>();
-
-function gcJobs() {
-  if (jobs.size <= MAX_JOBS_KEPT) return;
-  const finished = [...jobs.values()]
-    .filter((j) => j.status !== "running")
-    .sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
-  for (const j of finished.slice(0, jobs.size - MAX_JOBS_KEPT)) jobs.delete(j.id);
-}
+// Jobs in the same cwd run strictly serially: the git snapshot-diff that makes
+// files_changed trustworthy assumes one writer per working tree at a time.
+const cwdChains = new Map<string, Promise<void>>();
 
 function textResult(text: string, isError = false): ToolResult {
   return { content: [{ type: "text", text }], isError };
@@ -297,8 +317,99 @@ function structured(
   data: Record<string, unknown>,
   isError = false
 ): ToolResult {
-  return { content: [{ type: "text", text }], structuredContent: data, isError };
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: { v: SCHEMA_VERSION, ...data },
+    isError,
+  };
 }
+
+// --- persistence -----------------------------------------------------------
+
+function persistJob(job: Job) {
+  try {
+    mkdirSync(JOBS_DIR, { recursive: true });
+    writeFileSync(
+      join(JOBS_DIR, `${job.id}.json`),
+      JSON.stringify({
+        v: SCHEMA_VERSION,
+        id: job.id,
+        session_id: job.sessionId,
+        cwd: job.cwd,
+        model: job.model,
+        status: job.status,
+        queued_at: job.queuedAt,
+        started_at: job.startedAt ?? null,
+        finished_at: job.finishedAt ?? null,
+        result: job.result ?? null,
+      })
+    );
+    gcJobFiles();
+  } catch {
+    // persistence is best-effort; in-memory state still works
+  }
+}
+
+function gcJobFiles() {
+  try {
+    const files = readdirSync(JOBS_DIR)
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => ({ f, mtime: statSync(join(JOBS_DIR, f)).mtimeMs }))
+      .sort((a, b) => a.mtime - b.mtime);
+    for (const { f } of files.slice(0, Math.max(0, files.length - MAX_JOB_FILES))) {
+      unlinkSync(join(JOBS_DIR, f));
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+function loadPersistedJobs() {
+  try {
+    if (!existsSync(JOBS_DIR)) return;
+    for (const f of readdirSync(JOBS_DIR)) {
+      if (!f.endsWith(".json")) continue;
+      try {
+        const rec = JSON.parse(readFileSync(join(JOBS_DIR, f), "utf8"));
+        if (!rec?.id || jobs.has(rec.id)) continue;
+        const orphaned = rec.status === "running" || rec.status === "queued";
+        const job: Job = {
+          id: rec.id,
+          sessionId: rec.session_id,
+          cwd: rec.cwd,
+          model: rec.model,
+          status: orphaned ? "failed" : rec.status,
+          queuedAt: rec.queued_at ?? 0,
+          startedAt: rec.started_at ?? undefined,
+          finishedAt: rec.finished_at ?? Date.now(),
+          result: orphaned
+            ? structured(
+                `❌ The MCP server restarted while this job was ${rec.status}; its outcome was not captured. ` +
+                  `The grok process may or may not have finished its work — verify with git status in ${rec.cwd}, ` +
+                  `or resume the session (session_id: "${rec.session_id}") and ask grok what it completed.`,
+                {
+                  success: false,
+                  job_id: rec.id,
+                  session_id: rec.session_id,
+                  stop_reason: "ServerRestart",
+                },
+                true
+              )
+            : (rec.result ?? undefined),
+          done: Promise.resolve(),
+        };
+        jobs.set(job.id, job);
+        if (orphaned) persistJob(job);
+      } catch {
+        // skip corrupt record
+      }
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+// --- lifecycle -------------------------------------------------------------
 
 interface StartOpts {
   prompt: string;
@@ -312,39 +423,78 @@ interface StartOpts {
   warnings: string[];
 }
 
+function activeJobsInCwd(cwd: string): Job[] {
+  return [...jobs.values()].filter(
+    (j) => j.cwd === cwd && (j.status === "running" || j.status === "queued")
+  );
+}
+
 function startJob(opts: StartOpts): Job {
-  const id = randomUUID();
-  const before = gitSnapshot(opts.cwd);
-
-  // -s only creates NEW sessions (errors with "already in use" on an existing
-  // ID — verified; grok's --help is authoritative here, its README is not).
-  // Continuation therefore uses -r/--resume.
-  const args = [
-    "--no-auto-update",
-    "-p",
-    opts.prompt,
-    "-m",
-    opts.model,
-    opts.resume ? "-r" : "-s",
-    opts.sessionId,
-    "--output-format",
-    "json",
-  ];
-  if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
-  if (opts.effort) args.push("--effort", opts.effort);
-
   const job: Job = {
-    id,
+    id: randomUUID(),
     sessionId: opts.sessionId,
     cwd: opts.cwd,
     model: opts.model,
-    status: "running",
-    startedAt: Date.now(),
+    status: "queued",
+    queuedAt: Date.now(),
     done: Promise.resolve(),
   };
+  jobs.set(job.id, job);
 
-  job.done = new Promise<void>((resolveDone) => {
-    let child;
+  const prev = cwdChains.get(opts.cwd) ?? Promise.resolve();
+  job.done = prev.then(() => runJob(job, opts)).catch(() => {});
+  cwdChains.set(opts.cwd, job.done);
+  persistJob(job);
+  return job;
+}
+
+function runJob(job: Job, opts: StartOpts): Promise<void> {
+  return new Promise<void>((resolveDone) => {
+    const finish = (result: ToolResult, forceStatus?: "failed") => {
+      if (job.status === "completed" || job.status === "failed") return;
+      job.result = result;
+      job.status = forceStatus ?? (result.isError ? "failed" : "completed");
+      job.finishedAt = Date.now();
+      job.child = undefined;
+      persistJob(job);
+      resolveDone();
+    };
+
+    if (job.cancelRequested) {
+      finish(
+        structured(
+          `Job cancelled while queued — grok never started, nothing was changed.`,
+          { success: false, job_id: job.id, session_id: job.sessionId, stop_reason: "CancelledByCaller" },
+          true
+        )
+      );
+      return;
+    }
+
+    job.status = "running";
+    job.startedAt = Date.now();
+    persistJob(job);
+
+    const before = gitSnapshot(opts.cwd);
+
+    // -s only creates NEW sessions (errors with "already in use" on an
+    // existing ID — verified; grok's --help is authoritative here, its
+    // README is not). Continuation therefore uses -r/--resume.
+    const args = [
+      "--no-auto-update",
+      "-p",
+      opts.prompt,
+      "-m",
+      opts.model,
+      opts.resume ? "-r" : "-s",
+      opts.sessionId,
+      "--output-format",
+      "json",
+    ];
+    if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
+    if (opts.effort) args.push("--effort", opts.effort);
+
+    let child: ChildProcess;
     try {
       child = spawn(GROK_BIN, args, { cwd: opts.cwd, env: process.env });
     } catch (err: any) {
@@ -357,6 +507,7 @@ function startJob(opts: StartOpts): Job {
       );
       return;
     }
+    job.child = child;
 
     let stdout = "";
     let stderr = "";
@@ -368,8 +519,8 @@ function startJob(opts: StartOpts): Job {
       setTimeout(() => child.kill("SIGKILL"), 5000).unref();
     }, opts.timeoutMs);
 
-    child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
+    child.stdout!.on("data", (d) => (stdout += d));
+    child.stderr!.on("data", (d) => (stderr += d));
 
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -384,24 +535,19 @@ function startJob(opts: StartOpts): Job {
 
     child.on("close", (code) => {
       clearTimeout(timer);
-      finish(
-        buildResult({ opts, before, code, stdout, stderr, timedOut, job }),
-        undefined
-      );
+      finish(buildResult({ opts, before, code, stdout, stderr, timedOut, job }));
     });
-
-    function finish(result: ToolResult, forceStatus?: "failed") {
-      if (job.status !== "running") return;
-      job.result = result;
-      job.status = forceStatus ?? (result.isError ? "failed" : "completed");
-      job.finishedAt = Date.now();
-      resolveDone();
-      gcJobs();
-    }
   });
+}
 
-  jobs.set(id, job);
-  return job;
+function truncateResponse(text: string | null): { text: string | null; truncated: boolean } {
+  if (typeof text !== "string" || text.length <= MAX_RESPONSE_CHARS) {
+    return { text, truncated: false };
+  }
+  return {
+    text: text.slice(0, MAX_RESPONSE_CHARS) + "\n…[truncated]",
+    truncated: true,
+  };
 }
 
 function buildResult(ctx: {
@@ -414,13 +560,14 @@ function buildResult(ctx: {
   job: Job;
 }): ToolResult {
   const { opts, before, code, stdout, stderr, timedOut, job } = ctx;
-  const durationMs = Date.now() - job.startedAt;
+  const durationMs = Date.now() - (job.startedAt ?? job.queuedAt);
   const after = gitSnapshot(opts.cwd);
   const delta = before.isRepo ? gitDelta(opts.cwd, before, after) : null;
   const filesChanged = delta
     ? delta.filesChanged
     : readSessionFiles(opts.cwd, opts.sessionId);
   const commandsRun = readSessionCommands(opts.cwd, opts.sessionId);
+  const signals = readSessionSignals(opts.cwd, opts.sessionId);
 
   const base: Record<string, unknown> = {
     success: false,
@@ -432,6 +579,8 @@ function buildResult(ctx: {
     commands_run: commandsRun,
     duration_ms: durationMs,
     model: opts.model,
+    context_tokens_used: signals.contextTokensUsed,
+    tool_call_count: signals.toolCallCount,
   };
 
   const changesNote = delta
@@ -453,13 +602,26 @@ function buildResult(ctx: {
 
   const footer = `Session: ${opts.sessionId} · Job: ${job.id} · Duration: ${Math.round(durationMs / 1000)}s`;
 
+  // Any changes listed on a non-EndTurn path are PARTIAL work by definition:
+  // the run stopped before grok considered the task done.
+  const partialChangesNote =
+    `Changes on disk from this run — treat as PARTIAL, incomplete work:\n${changesNote}`;
+
+  if (job.cancelRequested) {
+    return structured(
+      `❌ Grok task cancelled by caller (grok_task_cancel).\n\n${partialChangesNote}\n\n${footer}`,
+      { ...base, stop_reason: "CancelledByCaller" },
+      true
+    );
+  }
+
   if (timedOut) {
     return structured(
       `❌ Grok task timed out after ${Math.round(opts.timeoutMs / 60000)} minutes and was killed.\n\n` +
         "If this was a genuinely long task, raise timeout_ms (or GROK_TASK_TIMEOUT_MS) and consider " +
         "background: true. If it hung early, a pending approval prompt is the likely cause — use " +
-        'permission_mode: "auto" or enable global always-approve (see README "Avoiding approval stalls").\n\n' +
-        `Changes on disk before the kill:\n${changesNote}\n\n${footer}\n\n` +
+        'permission_mode: "auto" or enable global always-approve (see README "Headless permissions").\n\n' +
+        `${partialChangesNote}\n\n${footer}\n\n` +
         `You can resume this session later by passing session_id: "${opts.sessionId}".`,
       { ...base, stop_reason: "Timeout" },
       true
@@ -491,16 +653,18 @@ function buildResult(ctx: {
 
   if (parsed === null || typeof parsed !== "object") {
     return structured(
-      `Grok exited 0 but produced unparseable output; raw stdout below.\n\n${stdout}\n\n${footer}`,
-      { ...base, stop_reason: "UnparseableOutput", raw_stdout: stdout.slice(0, 20000) },
+      `Grok exited 0 but produced unparseable output; raw stdout below.\n\n${stdout.slice(0, MAX_RESPONSE_CHARS)}\n\n${footer}`,
+      { ...base, stop_reason: "UnparseableOutput", raw_stdout: stdout.slice(0, MAX_RESPONSE_CHARS) },
       true
     );
   }
 
   const stopReason = String(parsed.stopReason ?? "unknown");
+  const { text: finalResponse, truncated } = truncateResponse(parsed.text ?? null);
 
   // Exit code 0 does NOT mean success: grok reports Cancelled with exit 0
-  // when a permission prompt fires headlessly (verified on 0.2.87).
+  // when a permission prompt fires headlessly (verified on 0.2.87). Every
+  // stop reason except EndTurn routes through this honest-failure path.
   if (stopReason !== "EndTurn") {
     const permHint =
       stopReason === "Cancelled"
@@ -512,23 +676,24 @@ function buildResult(ctx: {
     return structured(
       `❌ Grok task did NOT complete (stop reason: ${stopReason}). Treat this as a failure — ` +
         `partial output below is not a result summary.${permHint}\n\n` +
-        `Grok's last message:\n${parsed.text ?? "(none)"}\n\n` +
-        `Actual changes on disk (verify before trusting):\n${changesNote}\n\n${footer}`,
-      { ...base, stop_reason: stopReason, final_response: parsed.text ?? null },
+        `Grok's last message:\n${finalResponse ?? "(none)"}\n\n` +
+        `${partialChangesNote}\n\n${footer}`,
+      { ...base, stop_reason: stopReason, final_response: finalResponse, response_truncated: truncated },
       true
     );
   }
 
   const warningBlock = opts.warnings.length ? opts.warnings.join("\n") + "\n\n" : "";
   return structured(
-    `${warningBlock}## Grok task result\n\n${parsed.text ?? "(no response text)"}\n\n` +
+    `${warningBlock}## Grok task result\n\n${finalResponse ?? "(no response text)"}\n\n` +
       `${changesNote}\n${commandsNote}\n\n${footer} · Stop reason: EndTurn\n` +
       `To iterate on this work with context intact, pass session_id: "${opts.sessionId}" to the next grok_task call.`,
     {
       ...base,
       success: true,
       stop_reason: stopReason,
-      final_response: parsed.text ?? null,
+      final_response: finalResponse,
+      response_truncated: truncated,
       warnings: opts.warnings,
     },
     false
@@ -611,15 +776,31 @@ async function handleGrokTask(args: Record<string, unknown>, extra: any): Promis
     );
   }
 
+  const queuedBehind = activeJobsInCwd(cwd);
+  if (queuedBehind.length) {
+    warnings.push(
+      `⏳ ${queuedBehind.length} job(s) already active in this cwd — this job is QUEUED behind ` +
+        `${queuedBehind.map((j) => j.id).join(", ")}. Jobs in the same directory run serially so ` +
+        "files_changed stays accurate (parallel writers in one working tree would cross-contaminate results)."
+    );
+  }
+
   const job = startJob({ prompt, cwd, model, permissionMode, sessionId, resume, timeoutMs, effort, warnings });
 
   if (args.background === true) {
     return structured(
-      `Grok task started in background.\n\nJob: ${job.id}\nSession: ${sessionId}\n\n` +
+      `Grok task ${queuedBehind.length ? "QUEUED" : "started"} in background.\n\nJob: ${job.id}\nSession: ${sessionId}\n\n` +
         (warnings.length ? warnings.join("\n") + "\n\n" : "") +
         `Poll with grok_task_result (job_id: "${job.id}") — it waits up to max_wait_ms (default 25s) ` +
-        "per call and returns the final result when done.",
-      { success: true, job_id: job.id, session_id: sessionId, status: "running", warnings }
+        "per call and returns the final result when done. Cancel with grok_task_cancel.",
+      {
+        success: true,
+        job_id: job.id,
+        session_id: sessionId,
+        status: job.status,
+        queued_behind: queuedBehind.map((j) => j.id),
+        warnings,
+      }
     );
   }
 
@@ -630,13 +811,14 @@ async function handleGrokTask(args: Record<string, unknown>, extra: any): Promis
   let ticker: ReturnType<typeof setInterval> | undefined;
   if (progressToken !== undefined && typeof extra?.sendNotification === "function") {
     ticker = setInterval(() => {
+      const elapsed = Math.round((Date.now() - job.queuedAt) / 1000);
       extra
         .sendNotification({
           method: "notifications/progress",
           params: {
             progressToken,
-            progress: Math.round((Date.now() - job.startedAt) / 1000),
-            message: `grok task running (${Math.round((Date.now() - job.startedAt) / 1000)}s)`,
+            progress: elapsed,
+            message: `grok task ${job.status} (${elapsed}s)`,
           },
         })
         .catch(() => {});
@@ -656,14 +838,14 @@ async function handleGrokTask(args: Record<string, unknown>, extra: any): Promis
     if (ticker) clearInterval(ticker);
   }
 
-  if (job.status === "running") {
+  if (job.status === "running" || job.status === "queued") {
     // Client cancelled/timed out the request; the task continues.
     return structured(
-      `Request was cancelled by the client but the grok task IS STILL RUNNING.\n\n` +
+      `Request was cancelled by the client but the grok task IS STILL ${job.status.toUpperCase()}.\n\n` +
         `Job: ${job.id}\nSession: ${sessionId}\n\n` +
-        `Fetch the outcome with grok_task_result (job_id: "${job.id}"). Do not assume anything ` +
-        "about repo state until that returns.",
-      { success: false, job_id: job.id, session_id: sessionId, status: "running" },
+        `Fetch the outcome with grok_task_result (job_id: "${job.id}"), or stop it with grok_task_cancel. ` +
+        "Do not assume anything about repo state until one of those returns.",
+      { success: false, job_id: job.id, session_id: sessionId, status: job.status },
       true
     );
   }
@@ -671,7 +853,8 @@ async function handleGrokTask(args: Record<string, unknown>, extra: any): Promis
 }
 
 function jobStatusText(job: Job): string {
-  const elapsed = Math.round(((job.finishedAt ?? Date.now()) - job.startedAt) / 1000);
+  const ref = job.startedAt ?? job.queuedAt;
+  const elapsed = Math.round(((job.finishedAt ?? Date.now()) - ref) / 1000);
   return `Job ${job.id}: ${job.status} (${elapsed}s) · Session: ${job.sessionId} · cwd: ${job.cwd}`;
 }
 
@@ -681,7 +864,7 @@ async function handleTaskResult(args: Record<string, unknown>): Promise<ToolResu
   if (!job) {
     return textResult(
       `Unknown job_id: ${jobId || "(missing)"}. Known jobs:\n` +
-        ([...jobs.values()].map(jobStatusText).join("\n") || "(none — jobs do not survive server restarts)"),
+        ([...jobs.values()].map(jobStatusText).join("\n") || "(none)"),
       true
     );
   }
@@ -689,14 +872,14 @@ async function handleTaskResult(args: Record<string, unknown>): Promise<ToolResu
     Math.max(typeof args.max_wait_ms === "number" ? args.max_wait_ms : 25_000, 0),
     50_000
   );
-  if (job.status === "running" && maxWait > 0) {
+  if ((job.status === "running" || job.status === "queued") && maxWait > 0) {
     await Promise.race([job.done, new Promise((res) => setTimeout(res, maxWait))]);
   }
-  if (job.status === "running") {
+  if (job.status === "running" || job.status === "queued") {
     return structured(
-      `Still running (${Math.round((Date.now() - job.startedAt) / 1000)}s elapsed). ` +
+      `Still ${job.status} (${Math.round((Date.now() - job.queuedAt) / 1000)}s since dispatch). ` +
         `Call grok_task_result again with job_id: "${job.id}".`,
-      { job_id: job.id, session_id: job.sessionId, status: "running" }
+      { job_id: job.id, session_id: job.sessionId, status: job.status }
     );
   }
   return job.result!;
@@ -711,13 +894,41 @@ async function handleTaskStatus(args: Record<string, unknown>): Promise<ToolResu
       job_id: job.id,
       session_id: job.sessionId,
       status: job.status,
-      elapsed_ms: (job.finishedAt ?? Date.now()) - job.startedAt,
+      elapsed_ms: (job.finishedAt ?? Date.now()) - (job.startedAt ?? job.queuedAt),
     });
   }
   const all = [...jobs.values()];
   return structured(
-    all.length ? all.map(jobStatusText).join("\n") : "No jobs this server session.",
-    { jobs: all.map((j) => ({ job_id: j.id, session_id: j.sessionId, status: j.status })) }
+    all.length ? all.map(jobStatusText).join("\n") : "No jobs recorded.",
+    { jobs: all.map((j) => ({ job_id: j.id, session_id: j.sessionId, status: j.status, cwd: j.cwd })) }
+  );
+}
+
+async function handleTaskCancel(args: Record<string, unknown>): Promise<ToolResult> {
+  const jobId = typeof args.job_id === "string" ? args.job_id.trim() : "";
+  const job = jobs.get(jobId);
+  if (!job) return textResult(`Unknown job_id: ${jobId || "(missing)"}`, true);
+  if (job.status === "completed" || job.status === "failed") {
+    return structured(
+      `Job ${job.id} already finished (${job.status}) — nothing to cancel. Fetch its result with grok_task_result.`,
+      { job_id: job.id, session_id: job.sessionId, status: job.status }
+    );
+  }
+  job.cancelRequested = true;
+  if (job.child) {
+    job.child.kill("SIGTERM");
+    const child = job.child;
+    setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+  }
+  // Wait briefly for the close handler to produce the final (partial-work) result.
+  await Promise.race([job.done, new Promise((res) => setTimeout(res, 15_000))]);
+  return (
+    job.result ??
+    structured(
+      `Cancellation requested for job ${job.id}; grok has not exited yet. Poll grok_task_result for the final state.`,
+      { job_id: job.id, session_id: job.sessionId, status: job.status },
+      true
+    )
   );
 }
 
@@ -742,7 +953,7 @@ async function handleModels(): Promise<ToolResult> {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "grok-mcp", version: "0.2.0" },
+  { name: "grok-mcp", version: "0.3.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -755,6 +966,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "using the user's existing Grok OAuth login. Returns grok's response plus a git-verified list " +
         "of files changed and commands run. For tasks likely to exceed ~1 minute, pass background: true " +
         "and poll grok_task_result — long synchronous calls can hit the MCP client's request timeout. " +
+        "Jobs in the same cwd run serially (queued) to keep results accurate. " +
         "To continue a previous task with context intact, pass its session_id.",
       inputSchema: {
         type: "object",
@@ -806,7 +1018,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Fetch the result of a grok_task job (background, or one whose request timed out). Waits up to " +
         "max_wait_ms for completion, then returns either the final result or a still-running status. " +
-        "Safe to call repeatedly.",
+        "Safe to call repeatedly. Results persist across server restarts.",
       inputSchema: {
         type: "object",
         properties: {
@@ -823,12 +1035,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "grok_task_status",
       description:
         "Check status of grok_task jobs without blocking. Pass job_id for one job, omit it to list all " +
-        "jobs from this server session.",
+        "known jobs (including persisted ones from previous server sessions).",
       inputSchema: {
         type: "object",
         properties: {
           job_id: { type: "string", description: "Optional job ID to check." },
         },
+      },
+    },
+    {
+      name: "grok_task_cancel",
+      description:
+        "Cancel a queued or running grok_task job. Kills the grok process and returns the verified " +
+        "partial changes on disk. Finished jobs are not affected.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          job_id: { type: "string", description: "Job ID to cancel." },
+        },
+        required: ["job_id"],
       },
     },
     {
@@ -850,6 +1075,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         return await handleTaskResult(args);
       case "grok_task_status":
         return await handleTaskStatus(args);
+      case "grok_task_cancel":
+        return await handleTaskCancel(args);
       case "grok_models":
         return await handleModels();
       default:
@@ -860,6 +1087,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
 });
 
+loadPersistedJobs();
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`grok-mcp v0.2.0 ready (grok binary: ${GROK_BIN}, default timeout: ${ENV_TIMEOUT_MS}ms)`);
+console.error(`grok-mcp v0.3.0 ready (grok binary: ${GROK_BIN}, default timeout: ${ENV_TIMEOUT_MS}ms)`);

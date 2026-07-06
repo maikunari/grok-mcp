@@ -41,8 +41,24 @@ per call — call repeatedly while it reports `running`).
 
 ### `grok_task_status`
 
-Non-blocking status. Pass `job_id` for one job, omit to list all jobs from this
-server session. (Jobs live in server memory — they don't survive a server restart.)
+Non-blocking status. Pass `job_id` for one job, omit to list all known jobs.
+
+### `grok_task_cancel`
+
+Kill a queued or running job (`SIGTERM`, then `SIGKILL`). Returns the git-verified
+partial changes the run left on disk. Finished jobs are unaffected.
+
+**Job records persist to `~/.grok-mcp/jobs/`** (last 100), so `grok_task_result`
+still works after a server restart — including the Claude Desktop restart that a
+server upgrade requires. A job that was mid-run when the server died is reported as
+failed with stop reason `ServerRestart` and instructions to verify via git or resume
+the session; its outcome was not captured.
+
+**Concurrency: jobs in the same `cwd` run strictly serially.** The git snapshot-diff
+that makes `files_changed` trustworthy assumes one writer per working tree, and
+parallel grok runs in one repo would conflict anyway. A second job dispatched into
+the same directory is queued (the dispatch response says so, and behind which job);
+different directories run in parallel freely.
 
 ### `grok_models`
 
@@ -56,6 +72,7 @@ Every result includes human-readable text plus `structuredContent`:
 
 ```json
 {
+  "v": 2,
   "success": true,
   "stop_reason": "EndTurn",
   "job_id": "6c8a1268-…",
@@ -66,10 +83,18 @@ Every result includes human-readable text plus `structuredContent`:
   "commands_run": ["npm test"],
   "duration_ms": 28699,
   "model": "grok-composer-2.5-fast",
+  "context_tokens_used": 21871,
+  "tool_call_count": 4,
   "final_response": "…grok's own summary…",
+  "response_truncated": false,
   "warnings": []
 }
 ```
+
+`v` is the payload schema version — check it before parsing if you depend on the
+shape. `final_response` is capped at 16 000 chars (`response_truncated: true` when
+cut). `context_tokens_used` / `tool_call_count` come from grok's session signals,
+best effort — for budgeting when dispatching many jobs.
 
 - **`files_changed` is ground truth, not narration**: the server snapshots
   `git status --porcelain -uall` before and after the run and diffs the two (plus
@@ -77,9 +102,14 @@ Every result includes human-readable text plus `structuredContent`:
   run is fine — only new changes are listed. `diff_stat` is scoped to those files.
   In non-git directories it falls back to parsing grok's session transcript and says
   so via `files_changed_source: "transcript"`.
-- **`success: false` means it**: a run that ends with grok's `stopReason` anything
-  other than `EndTurn` (e.g. `Cancelled`) returns `isError: true` with the verified
-  on-disk changes — even though grok exits 0 in that case.
+- One deliberate blind spot: `git status --porcelain -uall` doesn't see edits to
+  **gitignored** files (`.env.local`, build output, …). If a task only touches
+  ignored files, `files_changed` is empty — by design, but worth knowing.
+- **`success: false` means it**: any run ending with grok's `stopReason` other than
+  `EndTurn` (`Cancelled`, or anything grok adds later) returns `isError: true` — even
+  though grok exits 0 in those cases. Changes listed on that path are explicitly
+  labeled **partial work**: the run stopped before grok considered the task done,
+  and a cancel can land after some edits persisted.
 - `commands_run` is best-effort transcript parsing (grok's headless output has no
   tool-call events), scoped to the current turn for resumed sessions.
 
@@ -170,6 +200,14 @@ auto-approval is detected, the result includes a warning instead.
 
 Uses your existing Grok Build OAuth login (token cached in `~/.grok/auth.json`). If a
 task fails with the auth-expired message, run `grok login` in a terminal and retry.
+
+## Development
+
+`npm run test:cli` pins the grok CLI behavior this server depends on (3 short real
+grok calls): `-s` creates new sessions and errors `already in use` on existing ones,
+`-r` resumes with context. Grok's own README claims `-s` resumes — its `--help` is
+correct and this server follows it. If grok ever changes `-s` to resume, this test
+fails loudly instead of the server breaking quietly.
 
 ## License
 
