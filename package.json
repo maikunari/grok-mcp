@@ -1,6 +1,6 @@
 {
   "name": "grok-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server that delegates coding tasks to Grok Build (headless) as a subagent",
   "type": "module",
   "private": true,

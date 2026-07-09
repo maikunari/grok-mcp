@@ -64,5 +64,41 @@ check(
   r3.out.slice(0, 200)
 );
 
+// 4. --permission-mode acceptEdits cancels headless runs at the first file
+//    write (creation or edit, no shell commands involved). The server warns
+//    callers off acceptEdits based on this — if grok fixes it to actually
+//    accept edits headlessly, relax the warning in src/index.ts and README.
+const r4 = grok([
+  "-p",
+  "Create a file named probe.txt containing exactly 'x'. Do not run any commands.",
+  "--permission-mode",
+  "acceptEdits",
+]);
+const cancelled = r4.code === 0 && JSON.parse(r4.out);
+check(
+  "acceptEdits cancels headlessly at the first file write",
+  cancelled && cancelled.stopReason === "Cancelled",
+  r4.out.slice(0, 200)
+);
+
+// 5. --permission-mode auto COMPLETES a file write headlessly, including in a
+//    git repo. The mode guidance in src/index.ts and README rests on this.
+//    Field reports exist of auto cancelling at the first write on other
+//    setups — if this check starts failing HERE, grok changed auto's
+//    semantics and the guidance needs rewriting, not just a warning tweak.
+execFileSync("git", ["init", "-q", "-b", "main", dir]);
+const r5 = grok([
+  "-p",
+  "Create a file named probe5.txt containing exactly 'x'. Do not run any commands.",
+  "--permission-mode",
+  "auto",
+]);
+const autoRun = r5.code === 0 && JSON.parse(r5.out);
+check(
+  "auto completes a file write headlessly (git repo)",
+  autoRun && autoRun.stopReason === "EndTurn",
+  r5.out.slice(0, 200)
+);
+
 rmSync(dir, { recursive: true, force: true });
 process.exit(failures ? 1 : 0);

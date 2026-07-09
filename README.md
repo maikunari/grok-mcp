@@ -15,12 +15,12 @@ and every result carries a machine-readable `structuredContent` payload.
 | --- | --- | --- |
 | `prompt` | yes | The coding task for Grok Build |
 | `cwd` | yes | Absolute path to the target repo/directory |
-| `model` | no | Grok model ID, validated up front. Default: `grok-composer-2.5-fast` |
+| `model` | no | Grok model ID, validated up front. Default: `grok-4.5` |
 | `permission_mode` | no | See [permissions](#headless-permissions-verified-behavior) below |
 | `session_id` | no | Session UUID from a previous result — resumes that session with context intact |
 | `background` | no | `true` → return immediately with a `job_id`; poll `grok_task_result` |
 | `timeout_ms` | no | Per-task timeout (default 15 min, clamped 10 s – 2 h) |
-| `effort` | no | `low` / `medium` / `high` (maps to grok's `--effort`) |
+| `effort` | no | `low` / `medium` / `high` (maps to grok's `--effort`). Default: `high` |
 
 Runs `grok --no-auto-update -p "<prompt>" -m <model> -s <uuid> --output-format json`
 (`-r <uuid>` when resuming) with the process `cwd` set to your target repo and your
@@ -82,7 +82,7 @@ Every result includes human-readable text plus `structuredContent`:
   "diff_stat": " 2 files changed, 2 insertions(+), 2 deletions(-)",
   "commands_run": ["npm test"],
   "duration_ms": 28699,
-  "model": "grok-composer-2.5-fast",
+  "model": "grok-4.5",
   "context_tokens_used": 21871,
   "tool_call_count": 4,
   "final_response": "…grok's own summary…",
@@ -178,10 +178,13 @@ Mode cheat-sheet for coding tasks:
 
 | `permission_mode` | Headless behavior |
 | --- | --- |
-| `auto` | **Recommended.** Edits + shell commands complete (verified) |
-| `bypassPermissions` | Everything auto-approved |
-| `acceptEdits` | Edits only — the first shell command **cancels the whole run** (verified) |
+| `auto` | **Recommended first choice.** Edits + shell commands complete (verified here on grok 0.2.87–0.2.93, git and non-git dirs, sync and background). *However*: field reports exist of `auto` cancelling at the first write on other machines — likely grok-version or workspace-trust dependent. If your runs cancel under `auto`, escalate to `bypassPermissions` |
+| `bypassPermissions` | Everything auto-approved — the only mode that suppresses every gate. The reliable mode for unattended coding, at the cost of a real trust expansion: grok approves all its own commands and writes in that cwd |
+| `acceptEdits` | **Not headless-viable** — cancels at the first file write, creation *or* edit, even with no shell commands (verified). Despite the name, it appears to require an interactive UI |
 | `default` / omitted | Uses the user's global config; cancels on any unapproved tool |
+
+An explicit `permission_mode` **overrides** the user's global always-approve config —
+passing `acceptEdits` makes runs fail even on machines where omitting it would work.
 
 Alternative to per-call modes: enable global auto-approve in `~/.grok/config.toml`
 (applies to *all* grok sessions, including interactive ones):

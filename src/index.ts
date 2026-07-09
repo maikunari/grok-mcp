@@ -19,9 +19,11 @@ import {
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-// Verified against Grok Build 0.2.87: `composer-2.5` is not a valid model ID
-// ("unknown model id"); the real ID for Composer 2.5 is below.
-const DEFAULT_MODEL = "grok-composer-2.5-fast";
+// Default to the CLI's current frontier model + high effort so callers that
+// just say "use grok" get Grok 4.5 without passing model/effort. Override per
+// call with `model` / `effort`. (Composer ID is still `grok-composer-2.5-fast`.)
+const DEFAULT_MODEL = "grok-4.5";
+const DEFAULT_EFFORT = "high";
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const ENV_TIMEOUT_MS =
   Number.parseInt(process.env.GROK_TASK_TIMEOUT_MS ?? "", 10) || DEFAULT_TIMEOUT_MS;
@@ -42,8 +44,9 @@ const JOBS_DIR = join(homedir(), ".grok-mcp", "jobs");
 
 // Headless-only flag values, from `grok --help` (0.2.87). Verified behavior:
 // modes that leave any tool un-approved don't stall headless runs — grok
-// CANCELS them (stopReason "Cancelled", exit 0). "acceptEdits" cancels as
-// soon as the task runs a shell command; "auto" completes edits + commands.
+// CANCELS them (stopReason "Cancelled", exit 0). "acceptEdits" is not
+// headless-viable at all: it cancels at the first file WRITE (creation or
+// edit, even with no shell commands). "auto" completes edits + commands.
 const PERMISSION_MODES = [
   "default",
   "acceptEdits",
@@ -668,17 +671,32 @@ function buildResult(ctx: {
   if (stopReason !== "EndTurn") {
     const permHint =
       stopReason === "Cancelled"
-        ? "\n\nLikely cause: a tool needed an approval no one could answer headlessly, so grok " +
-          `cancelled the run (permission_mode was ${opts.permissionMode ? `"${opts.permissionMode}"` : "grok's default"}). ` +
-          'Note "acceptEdits" only auto-approves file edits — any shell command cancels the run. ' +
-          'For coding tasks use permission_mode: "auto" (or "bypassPermissions"), or enable global always-approve.'
+        ? "\n\nLikely cause: a permission gate nothing could answer headlessly (permission_mode was " +
+          `${opts.permissionMode ? `"${opts.permissionMode}"` : "grok's default — no explicit mode"}). ` +
+          "Escalation path — re-run with the next mode up:\n" +
+          '- omitted/"default" → try permission_mode: "auto"\n' +
+          '- "auto" → try permission_mode: "bypassPermissions". Auto-approves EVERYTHING grok attempts ' +
+          "in this cwd (a real trust expansion), but it is the only mode that suppresses every gate.\n" +
+          '- "acceptEdits" → not headless-viable at all: cancels at the first file write (verified).\n' +
+          'Field note: "auto" completes writes on some setups but has been reported to cancel at the ' +
+          "first write on others (grok version / trust-state dependent) — if that matches what you're " +
+          "seeing, bypassPermissions is the reliable fallback for unattended coding."
         : "";
+    const stderrTail = stderr.trim()
+      ? `\n\nstderr (tail):\n${stderr.trim().split("\n").slice(-20).join("\n")}`
+      : "";
     return structured(
       `❌ Grok task did NOT complete (stop reason: ${stopReason}). Treat this as a failure — ` +
         `partial output below is not a result summary.${permHint}\n\n` +
         `Grok's last message:\n${finalResponse ?? "(none)"}\n\n` +
-        `${partialChangesNote}\n\n${footer}`,
-      { ...base, stop_reason: stopReason, final_response: finalResponse, response_truncated: truncated },
+        `${partialChangesNote}\n\nExit code: ${code}${stderrTail}\n\n${footer}`,
+      {
+        ...base,
+        stop_reason: stopReason,
+        final_response: finalResponse,
+        response_truncated: truncated,
+        exit_code: code,
+      },
       true
     );
   }
@@ -736,8 +754,9 @@ async function handleGrokTask(args: Record<string, unknown>, extra: any): Promis
     );
   }
 
-  const effort = typeof args.effort === "string" && args.effort ? args.effort : undefined;
-  if (effort && !EFFORT_LEVELS.includes(effort)) {
+  const effort =
+    typeof args.effort === "string" && args.effort ? args.effort : DEFAULT_EFFORT;
+  if (!EFFORT_LEVELS.includes(effort)) {
     return textResult(`Invalid effort "${effort}". Valid values: ${EFFORT_LEVELS.join(", ")}`, true);
   }
 
@@ -771,8 +790,10 @@ async function handleGrokTask(args: Record<string, unknown>, extra: any): Promis
   }
   if (permissionMode === "acceptEdits") {
     warnings.push(
-      '⚠️ permission_mode "acceptEdits" auto-approves file edits only — if the task runs any shell ' +
-        'command, grok cancels the whole run (verified). Use "auto" for coding tasks that may run commands.'
+      '⚠️ permission_mode "acceptEdits" does NOT work headlessly: verified on Grok Build 0.2.87, it ' +
+        "cancels the run at the FIRST file write — new file or edit, even with no shell commands. " +
+        'Unless this task is strictly read-only, use "auto" instead, or omit permission_mode to ' +
+        "inherit the global config."
     );
   }
 
@@ -797,7 +818,9 @@ async function handleGrokTask(args: Record<string, unknown>, extra: any): Promis
         success: true,
         job_id: job.id,
         session_id: sessionId,
-        status: job.status,
+        // job.status is technically "queued" for a microtask even when the
+        // queue is empty; report what the caller will actually observe.
+        status: queuedBehind.length ? "queued" : "running",
         queued_behind: queuedBehind.map((j) => j.id),
         warnings,
       }
@@ -943,8 +966,8 @@ async function handleModels(): Promise<ToolResult> {
   return structured(
     models
       .map((m) => `- ${m.id}${m.id === DEFAULT_MODEL ? " (default)" : ""} — ${m.name}: ${m.description}`)
-      .join("\n"),
-    { models, default: DEFAULT_MODEL }
+      .join("\n") + `\n\nDefault effort: ${DEFAULT_EFFORT}`,
+    { models, default: DEFAULT_MODEL, default_effort: DEFAULT_EFFORT }
   );
 }
 
@@ -953,7 +976,7 @@ async function handleModels(): Promise<ToolResult> {
 // ---------------------------------------------------------------------------
 
 const server = new Server(
-  { name: "grok-mcp", version: "0.3.0" },
+  { name: "grok-mcp", version: "0.4.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -978,15 +1001,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           model: {
             type: "string",
-            description: `Grok model ID (default: ${DEFAULT_MODEL}). Use grok_models to list valid IDs.`,
+            description: `Grok model ID (default: ${DEFAULT_MODEL}). Use grok_models to list valid IDs. Pass grok-composer-2.5-fast for Composer.`,
           },
           permission_mode: {
             type: "string",
             enum: PERMISSION_MODES,
             description:
               'Grok permission mode. Headless-viable for coding tasks: "auto" (recommended) or ' +
-              '"bypassPermissions". "acceptEdits" cancels the run if the task executes any shell command. ' +
-              "Omit to use grok's default (relies on the user's global config).",
+              '"bypassPermissions". "acceptEdits" is NOT headless-viable — it cancels the run at the ' +
+              "first file write. Omit to use grok's default (relies on the user's global config).",
           },
           session_id: {
             type: "string",
@@ -1007,7 +1030,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           effort: {
             type: "string",
             enum: EFFORT_LEVELS,
-            description: "Grok effort level (maps to --effort).",
+            description: `Grok effort level (maps to --effort; default: ${DEFAULT_EFFORT}).`,
           },
         },
         required: ["prompt", "cwd"],
@@ -1090,4 +1113,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 loadPersistedJobs();
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`grok-mcp v0.3.0 ready (grok binary: ${GROK_BIN}, default timeout: ${ENV_TIMEOUT_MS}ms)`);
+console.error(
+  `grok-mcp v0.4.0 ready (grok binary: ${GROK_BIN}, default model: ${DEFAULT_MODEL}, effort: ${DEFAULT_EFFORT}, timeout: ${ENV_TIMEOUT_MS}ms)`
+);
